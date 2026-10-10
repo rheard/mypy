@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
-from mypyc.common import PROPSET_PREFIX, JsonDict
+from mypyc.common import PROPCACHE_PREFIX, PROPSET_PREFIX, JsonDict
 from mypyc.ir.func_ir import FuncDecl, FuncIR, FuncSignature, RuntimeArg
 from mypyc.ir.ops import DeserMaps, Value
 from mypyc.ir.rtypes import RInstance, RType, c_int_rprimitive, deserialize_type, object_rprimitive
@@ -404,6 +404,10 @@ class ClassIR:
 
     def is_deletable(self, name: str) -> bool:
         return any(name in ir.deletable for ir in self.mro)
+
+    def is_cached_property(self, name: str) -> bool:
+        """Is the attribute a functools.cached_property backed by a hidden cache slot?"""
+        return any(PROPCACHE_PREFIX + name in ir.attributes for ir in self.mro)
 
     def is_always_defined(self, name: str) -> bool:
         if self.is_deletable(name):

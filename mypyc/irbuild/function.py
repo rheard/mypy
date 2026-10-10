@@ -20,6 +20,7 @@ from mypy.nodes import (
     ArgKind,
     ClassDef,
     Decorator,
+    Expression,
     FuncBase,
     FuncDef,
     FuncItem,
@@ -28,8 +29,9 @@ from mypy.nodes import (
     TypeInfo,
     Var,
 )
+from mypy.semanal import refers_to_fullname
 from mypy.types import CallableType, Type, UnboundType, get_proper_type
-from mypyc.common import FAST_PREFIX, LAMBDA_NAME, PROPSET_PREFIX, SELF_NAME
+from mypyc.common import FAST_PREFIX, LAMBDA_NAME, PROPCACHE_PREFIX, PROPSET_PREFIX, SELF_NAME
 from mypyc.ir.class_ir import ClassIR, NonExtClassInfo
 from mypyc.ir.func_ir import (
     FUNC_CLASSMETHOD,
@@ -42,10 +44,14 @@ from mypyc.ir.func_ir import (
 )
 from mypyc.ir.ops import (
     BasicBlock,
+    Box,
+    Branch,
+    Cast,
     ComparisonOp,
     GetAttr,
     Integer,
     LoadLiteral,
+    Op,
     Register,
     Return,
     SetAttr,
@@ -77,6 +83,7 @@ from mypyc.irbuild.env_class import (
 )
 from mypyc.irbuild.generator import gen_generator_func, gen_generator_func_body
 from mypyc.irbuild.targets import AssignmentTarget
+from mypyc.irbuild.util import get_property_decorator, is_cached_property
 from mypyc.primitives.dict_ops import (
     dict_get_method_with_none,
     dict_new_op,
@@ -521,7 +528,19 @@ def handle_ext_method(builder: IRBuilder, cdef: ClassDef, fdef: FuncDef) -> None
             py_setattr_op, [typ, builder.load_str(name), decorated_func], fdef.line
         )
 
+    cached_property = False
     if fdef.is_property:
+        if is_cached_property_class_member(cdef, fdef.name):
+            if class_ir.is_trait:
+                builder.error(
+                    '"functools.cached_property" is unsupported in traits and protocols', fdef.line
+                )
+            else:
+                # Add caching to the getter of a functools.cached_property
+                # (the setter is synthesized below).
+                cached_property = True
+                insert_cached_property_ops(func_ir, PROPCACHE_PREFIX + fdef.name, fdef.line)
+
         # If there is a property setter, it will be processed after the getter,
         # We populate the optional setter field with none for now.
         assert name not in class_ir.properties
@@ -534,6 +553,48 @@ def handle_ext_method(builder: IRBuilder, cdef: ClassDef, fdef: FuncDef) -> None
         class_ir.properties[name] = (getter_ir, func_ir)
 
     class_ir.methods[func_ir.decl.name] = func_ir
+
+    if cached_property:
+        # Synthesize the setter of a functools.cached_property. Note that this
+        # must be added to class_ir.methods immediately after the getter, since
+        # the vtable layout assumes that a property setter directly follows the
+        # getter.
+        setter_name = PROPSET_PREFIX + name
+        setter_ir = gen_cached_property_setter_ir(
+            builder, class_ir.method_decls[setter_name], fdef.line
+        )
+        builder.functions.append(setter_ir)
+        class_ir.methods[setter_name] = setter_ir
+        class_ir.properties[name] = (func_ir, setter_ir)
+
+        # Like the getter (see below), the setter needs a glue method if it
+        # overrides the setter of a property with a different type.
+        for base in class_ir.mro[1:]:
+            base_setter = base.method_decls.get(setter_name)
+            if base_setter is not None and not is_same_method_signature(
+                setter_ir.sig, base_setter.sig
+            ):
+                f = gen_glue_property_setter(
+                    builder,
+                    base_setter.sig,
+                    setter_ir,
+                    class_ir,
+                    base,
+                    fdef.line,
+                    do_pysetattr=False,
+                )
+                class_ir.glue_methods[(base, setter_name)] = f
+                builder.functions.append(f)
+
+        if class_ir.allow_interpreted_subclasses:
+            # Generate a shadow glue method for the setter so that attribute
+            # assignment dispatches properly for instances of interpreted
+            # subclasses.
+            f = gen_glue_property_setter(
+                builder, setter_ir.sig, setter_ir, class_ir, class_ir, fdef.line
+            )
+            class_ir.glue_methods[(class_ir, setter_name)] = f
+            builder.functions.append(f)
 
     # If this overrides a parent class method with a different type, we need
     # to generate a glue method to mediate between them.
@@ -597,7 +658,14 @@ def handle_non_ext_method(
 
     # TODO: Support property setters in non-extension classes
     if fdef.is_property:
-        prop = builder.load_module_attr_by_fullname("builtins.property", fdef.line)
+        decorator = get_property_decorator_of_method(cdef, fdef)
+        if decorator is None or refers_to_fullname(decorator, "builtins.property"):
+            prop = builder.load_module_attr_by_fullname("builtins.property", fdef.line)
+        else:
+            # Use the original decorator, since for example functools.cached_property
+            # and enum.property behave differently. Non-extension classes have an
+            # instance __dict__, so functools.cached_property works as is.
+            prop = builder.accept(decorator)
         func_reg = builder.py_call(prop, [func_reg], fdef.line)
 
     elif builder.mapper.func_to_decl[fdef].kind == FUNC_CLASSMETHOD:
@@ -871,13 +939,24 @@ def gen_glue_property(
 
 
 def gen_glue_property_setter(
-    builder: IRBuilder, sig: FuncSignature, target: FuncIR, cls: ClassIR, base: ClassIR, line: int
+    builder: IRBuilder,
+    sig: FuncSignature,
+    target: FuncIR,
+    cls: ClassIR,
+    base: ClassIR,
+    line: int,
+    do_pysetattr: bool = True,
 ) -> FuncIR:
-    """Generate a shadow glue method for a property setter.
+    """Generate a glue method for a property setter.
 
-    For interpreted subclasses, property setters can't be called via the
-    internal __mypyc_setter__<name> method. Instead, use Python's setattr
-    to set the property via the standard descriptor protocol.
+    If do_pysetattr is True, generate a shadow glue method. For interpreted
+    subclasses, property setters can't be called via the internal
+    __mypyc_setter__<name> method. Instead, use Python's setattr to set the
+    property via the standard descriptor protocol.
+
+    Otherwise call the setter, coercing the value to the type it expects.
+    This is needed when a cached property overrides a settable property of a
+    different type.
     """
     builder.enter()
     builder.ret_types[-1] = sig.ret_type
@@ -891,19 +970,22 @@ def gen_glue_property_setter(
     self_arg = args[0]
     value_arg = args[1]
 
-    # Extract the property name from "__mypyc_setter__<name>"
-    assert target.name.startswith(PROPSET_PREFIX)
-    prop_name = target.name[len(PROPSET_PREFIX) :]
+    if do_pysetattr:
+        # Extract the property name from "__mypyc_setter__<name>"
+        assert target.name.startswith(PROPSET_PREFIX)
+        prop_name = target.name[len(PROPSET_PREFIX) :]
 
-    builder.primitive_op(
-        py_setattr_op,
-        [
-            self_arg,
-            builder.load_str(prop_name),
-            builder.coerce(value_arg, object_rprimitive, line),
-        ],
-        line,
-    )
+        builder.primitive_op(
+            py_setattr_op,
+            [
+                self_arg,
+                builder.load_str(prop_name),
+                builder.coerce(value_arg, object_rprimitive, line),
+            ],
+            line,
+        )
+    else:
+        builder.builder.call(target.decl, args, arg_info.arg_kinds, arg_info.arg_names, line)
     retval = builder.coerce(builder.none(), sig.ret_type, line)
     builder.add(Return(retval))
 
@@ -1238,6 +1320,98 @@ def gen_property_setter_ir(
     line = func_decl._line or -1
     if not is_trait:
         builder.add(SetAttr(self_reg, attr_name, value_reg, line))
+    builder.add(Return(builder.none(), line))
+    args, _, blocks, ret_type, fn_info = builder.leave()
+    return FuncIR(func_decl, args, blocks, line)
+
+
+def is_cached_property_class_member(cdef: ClassDef, name: str) -> bool:
+    """Is the class member with the given name a functools.cached_property?"""
+    sym = cdef.info.names.get(name)
+    return sym is not None and isinstance(sym.node, Decorator) and is_cached_property(sym.node)
+
+
+def get_property_decorator_of_method(cdef: ClassDef, fdef: FuncDef) -> Expression | None:
+    """Return the decorator that made a method a property, if any."""
+    sym = cdef.info.names.get(fdef.name)
+    if sym is not None and isinstance(sym.node, Decorator) and sym.node.func is fdef:
+        return get_property_decorator(sym.node)
+    return None
+
+
+def insert_cached_property_ops(func_ir: FuncIR, slot: str, line: int) -> None:
+    """Add caching ops to the getter of a functools.cached_property.
+
+    The cached value is stored in a hidden attribute (the cache slot named
+    'slot', declared in the prepare phase). The transformed getter is
+    equivalent to this:
+
+        if is_defined(self.<slot>):
+            return self.<slot>
+        ... original body, with each "return r" replaced by ...
+        self.<slot> = r
+        return r
+
+    Boxed property types are stored in the slot as-is, with NULL marking an
+    undefined (not yet cached) value. Unboxed types (such as int) are stored
+    in a boxed form, since they may not have a dedicated error value.
+    """
+    self_reg = func_ir.arg_regs[0]
+    ret_type = func_ir.decl.sig.ret_type
+
+    # Store the computed value in the cache slot before each return.
+    for block in func_ir.blocks:
+        new_ops: list[Op] = []
+        for op in block.ops:
+            if isinstance(op, Return):
+                value = op.value
+                boxed: Value = value
+                if value.type.is_unboxed:
+                    box = Box(value, op.line)
+                    new_ops.append(box)
+                    boxed = box
+                new_ops.append(SetAttr(self_reg, slot, boxed, op.line))
+            new_ops.append(op)
+        block.ops = new_ops
+
+    # Create a new entry block that returns the value of the cache slot if it
+    # is defined, and otherwise runs the original getter body (which now also
+    # stores the computed value in the cache slot).
+    entry, cache_hit = BasicBlock(), BasicBlock()
+    compute = func_ir.blocks[0]
+    cached = GetAttr(self_reg, slot, line, allow_error_value=True)
+    entry.ops.append(cached)
+    entry.ops.append(Branch(cached, compute, cache_hit, Branch.IS_ERROR))
+    result: Value = cached
+    if ret_type.is_unboxed:
+        result = Unbox(cached, ret_type, line)
+        cache_hit.ops.append(result)
+    elif not is_same_type(ret_type, cached.type):
+        # The property in a subclass may have a narrower type than the
+        # cache slot defined in a base class.
+        result = Cast(cached, ret_type, line)
+        cache_hit.ops.append(result)
+    cache_hit.ops.append(Return(result, line))
+    func_ir.blocks = [entry, cache_hit, *func_ir.blocks]
+
+
+def gen_cached_property_setter_ir(builder: IRBuilder, func_decl: FuncDecl, line: int) -> FuncIR:
+    """Generate the setter of a functools.cached_property.
+
+    Assigning to a cached property stores the value in the cache slot,
+    similar to functools.cached_property in CPython (where an assignment
+    overrides the cached value through the instance __dict__).
+    """
+    name = func_decl.name
+    builder.enter(name)
+    self_type = func_decl.sig.args[0].type
+    self_reg = builder.add_argument("self", self_type)
+    value_reg = builder.add_argument("value", func_decl.sig.args[1].type)
+    assert name.startswith(PROPSET_PREFIX)
+    slot = PROPCACHE_PREFIX + name[len(PROPSET_PREFIX) :]
+    assert isinstance(self_type, RInstance), self_type
+    slot_type = self_type.class_ir.attr_type(slot)
+    builder.add(SetAttr(self_reg, slot, builder.coerce(value_reg, slot_type, line), line))
     builder.add(Return(builder.none(), line))
     args, _, blocks, ret_type, fn_info = builder.leave()
     return FuncIR(func_decl, args, blocks, line)

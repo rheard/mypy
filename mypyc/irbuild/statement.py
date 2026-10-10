@@ -1282,7 +1282,9 @@ def transform_del_item(builder: IRBuilder, target: AssignmentTarget, line: int) 
     elif isinstance(target, AssignmentTargetAttr):
         if isinstance(target.obj_type, RInstance):
             cl = target.obj_type.class_ir
-            if not cl.is_deletable(target.attr):
+            # Deleting a functools.cached_property is supported: it clears the
+            # cached value (the property descriptor handles the deletion).
+            if not cl.is_deletable(target.attr) and not cl.is_cached_property(target.attr):
                 _, decl_cl = cl.attr_details(target.attr)
                 name = source_name_from_generator_attribute(target.attr, decl_cl.fullname)
                 builder.error(f'"{name}" cannot be deleted', line)

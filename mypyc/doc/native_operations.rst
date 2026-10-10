@@ -42,6 +42,7 @@ Method decorators
 -----------------
 
 * ``@property``
+* ``@functools.cached_property``
 * ``@staticmethod``
 * ``@classmethod``
 * ``@abc.abstractmethod``

@@ -4041,3 +4041,113 @@ assert o.ITEMS == [1, 2]
 b: Any = Base()
 assert b.COMPUTED == 7
 assert b.ITEMS is Base.ITEMS
+
+[case testCachedPropertyMultiModule]
+from functools import cached_property
+from other import Other
+
+class Sub(Other):
+    @cached_property
+    def triple(self) -> int:
+        self.compute_count += 1
+        return self.x * 30
+
+def get_triple(o: Other) -> int:
+    return o.triple
+
+def test_cached_property_in_other_module() -> None:
+    o = Other(3)
+    assert o.triple == 9
+    assert o.triple == 9
+    assert o.compute_count == 1
+    o.triple = 4
+    assert o.triple == 4
+    del o.triple
+    assert o.triple == 9
+    assert o.compute_count == 2
+
+def test_override_in_other_module() -> None:
+    s = Sub(3)
+    assert get_triple(s) == 90
+    assert s.triple == 90
+    assert s.compute_count == 1
+    s.triple = 5
+    assert get_triple(s) == 5
+    del s.triple
+    assert get_triple(s) == 90
+    assert s.compute_count == 2
+
+[file other.py]
+from functools import cached_property
+
+class Other:
+    def __init__(self, x: int) -> None:
+        self.x = x
+        self.compute_count = 0
+
+    @cached_property
+    def triple(self) -> int:
+        self.compute_count += 1
+        return self.x * 3
+
+[case testIncrementalCompilationCachedPropertyOverride]
+# In step 2, other.py is loaded from the cache, which doesn't have the original
+# decorators. Sub must still share the cached value with Base.
+from functools import cached_property
+from typing import List
+from other import Base
+
+class Sub(Base):
+    @cached_property
+    def value(self) -> List[int]:
+        self.calls += 1
+        return [1]
+
+def get(b: Base) -> object:
+    return b.value
+
+[file native.py.2]
+from functools import cached_property
+from typing import List
+from other import Base
+
+class Sub(Base):
+    @cached_property
+    def value(self) -> List[int]:
+        self.calls += 1
+        return [2]
+
+def get(b: Base) -> object:
+    return b.value
+
+[file other.py]
+from functools import cached_property
+
+class Base:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    @cached_property
+    def value(self) -> object:
+        self.calls += 1
+        return "base"
+
+[file driver.py]
+from native import Sub, get
+s = Sub()
+print("computed:", get(s), s.value, s.calls)
+s.value = [3]
+print("assigned:", get(s), s.value)
+del s.value
+print("deleted:", get(s), s.calls)
+
+[out]
+computed: [1] [1] 1
+assigned: [3] [3]
+deleted: [1] 2
+[out2]
+computed: [2] [2] 1
+assigned: [3] [3]
+deleted: [2] 2
+
+[rechecked native]

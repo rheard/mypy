@@ -2584,6 +2584,12 @@ test_use_after_passing_to_prop_setter()
 import other
 import other_interpreted
 
+# A property without a deleter can't be deleted (this used to crash)
+from native import A
+from testutil import assertRaises
+with assertRaises(AttributeError, "'A' object attribute 'x' cannot be deleted"):
+    del A().x
+
 [out]
 
 [case testPropertySetterWiderThanGetter]
@@ -7054,3 +7060,455 @@ def test_interpreted_subclass_shadowing() -> None:
     assert (o.read_literal(), o.LITERAL) == (5, 97)
     assert o.read_items() is C.ITEMS
     assert o.ITEMS == [1]
+
+[case testCachedProperty]
+from functools import cached_property
+from typing import List
+
+from testutil import assertRaises
+
+class C:
+    def __init__(self, x: int) -> None:
+        self.x = x
+        self.compute_count = 0
+
+    @cached_property
+    def boxed(self) -> List[int]:
+        self.compute_count += 1
+        return [self.x]
+
+    @cached_property
+    def unboxed(self) -> int:
+        self.compute_count += 1
+        return self.x * 2
+
+def test_body_runs_once() -> None:
+    c = C(5)
+    assert c.compute_count == 0
+    l = c.boxed
+    assert l == [5]
+    assert c.boxed is l
+    assert c.boxed is l
+    assert c.compute_count == 1
+    assert c.unboxed == 10
+    assert c.unboxed == 10
+    assert c.compute_count == 2
+
+def test_assignment_overrides_cached_value() -> None:
+    c = C(1)
+    c.unboxed = 42
+    assert c.unboxed == 42
+    c.boxed = [7]
+    assert c.boxed == [7]
+    assert c.compute_count == 0
+    # Assignment also overrides an already cached value
+    c2 = C(1)
+    assert c2.unboxed == 2
+    c2.unboxed = 3
+    assert c2.unboxed == 3
+    assert c2.compute_count == 1
+
+class PreSet(C):
+    def __init__(self) -> None:
+        super().__init__(1)
+        self.unboxed = 100
+
+def test_assignment_in_init() -> None:
+    d = PreSet()
+    assert d.unboxed == 100
+    assert d.compute_count == 0
+
+def test_del_invalidates_cached_value() -> None:
+    c = C(3)
+    assert c.unboxed == 6
+    assert c.compute_count == 1
+    del c.unboxed
+    assert c.unboxed == 6
+    assert c.compute_count == 2
+    del c.unboxed
+    # There is no cached value to delete now
+    with assertRaises(AttributeError, "attribute 'unboxed' of 'C' undefined"):
+        del c.unboxed
+    assert c.unboxed == 6
+    assert c.compute_count == 3
+
+class Branches:
+    def __init__(self, mode: int) -> None:
+        self.mode = mode
+        self.compute_count = 0
+
+    @cached_property
+    def value(self) -> int:
+        self.compute_count += 1
+        if self.mode == 0:
+            return 10
+        for i in range(5):
+            if i == self.mode:
+                return i
+        try:
+            if self.mode == 5:
+                return 50
+            if self.mode == 6:
+                raise ValueError("mode 6")
+        finally:
+            self.compute_count += 100
+        while self.mode == 7:
+            return 70
+        return -1
+
+def test_multiple_returns() -> None:
+    for mode, expected, count in [(0, 10, 1), (3, 3, 1), (5, 50, 101), (7, 70, 101), (8, -1, 101)]:
+        b = Branches(mode)
+        assert b.value == expected
+        assert b.value == expected
+        assert b.compute_count == count
+
+def test_exception_is_not_cached() -> None:
+    b = Branches(6)
+    with assertRaises(ValueError, "mode 6"):
+        b.value
+    with assertRaises(ValueError, "mode 6"):
+        b.value
+    assert b.compute_count == 202
+    b.mode = 0
+    assert b.value == 10
+    assert b.value == 10
+    assert b.compute_count == 203
+
+class Base:
+    def __init__(self) -> None:
+        self.count = 0
+
+    @cached_property
+    def prop(self) -> int:
+        self.count += 1
+        return 1
+
+class Sub(Base):
+    @cached_property
+    def prop(self) -> int:
+        self.count += 1
+        return 2
+
+class SubNoOverride(Base):
+    pass
+
+def read_prop(b: Base) -> int:
+    return b.prop
+
+def test_subclass_override() -> None:
+    b = Base()
+    s = Sub()
+    n = SubNoOverride()
+    assert read_prop(b) == 1
+    assert read_prop(s) == 2
+    assert read_prop(n) == 1
+    assert read_prop(b) == 1
+    assert read_prop(s) == 2
+    assert read_prop(n) == 1
+    assert b.count == 1
+    assert s.count == 1
+    assert n.count == 1
+    b.prop = 5
+    assert read_prop(b) == 5 and read_prop(s) == 2
+
+def test_access_from_interpreted_code() -> None:
+    import interp
+    c = C(4)
+    assert interp.read_boxed(c) == [4]
+    assert interp.read_boxed(c) is c.boxed
+    assert c.compute_count == 1
+    interp.write_unboxed(c, 13)
+    assert c.unboxed == 13
+    assert c.compute_count == 1
+    interp.del_unboxed(c)
+    assert c.unboxed == 8
+    assert c.compute_count == 2
+    del c.unboxed
+    with assertRaises(AttributeError, "attribute 'unboxed' of 'C' undefined"):
+        interp.del_unboxed(c)
+
+[file interp.py]
+def read_boxed(c):
+    return c.boxed
+
+def write_unboxed(c, val):
+    c.unboxed = val
+
+def del_unboxed(c):
+    del c.unboxed
+
+[case testCachedPropertyOverride]
+from functools import cached_property
+from typing import Optional
+
+from testutil import assertRaises
+
+class A:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    @cached_property
+    def p(self) -> object:
+        self.calls += 1
+        return "a"
+
+    @cached_property
+    def q(self) -> Optional[float]:
+        self.calls += 1
+        return None
+
+class B(A):
+    # These have narrower types than in the base class, so both the getters
+    # and the setters need glue methods
+    @cached_property
+    def p(self) -> int:
+        self.calls += 1
+        return 1
+
+    @cached_property
+    def q(self) -> float:
+        self.calls += 1
+        return 1.5
+
+def get_p(a: A) -> object:
+    return a.p
+
+def set_p(a: A, v: object) -> None:
+    a.p = v
+
+def get_q(a: A) -> Optional[float]:
+    return a.q
+
+def set_q(a: A, v: Optional[float]) -> None:
+    a.q = v
+
+def test_override_with_narrower_type() -> None:
+    b = B()
+    assert get_p(b) == 1
+    assert b.p == 1
+    assert get_q(b) == 1.5
+    assert b.q == 1.5
+    assert b.calls == 2
+    set_p(b, 5)
+    assert b.p == 5
+    assert get_p(b) == 5
+    set_q(b, 2.5)
+    assert b.q == 2.5
+    assert get_q(b) == 2.5
+    # The values are type checked, as usual in compiled code
+    with assertRaises(TypeError):
+        set_p(b, "x")
+    with assertRaises(TypeError):
+        set_q(b, None)
+    assert b.p == 5
+    assert b.q == 2.5
+    assert b.calls == 2
+
+class ReadOnly:
+    @property
+    def r(self) -> int:
+        return 1
+
+class CachedOverridesReadOnly(ReadOnly):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    @cached_property
+    def r(self) -> int:
+        self.calls += 1
+        return 2
+
+def get_r(o: ReadOnly) -> int:
+    return o.r
+
+def test_cached_property_overrides_read_only_property() -> None:
+    o = CachedOverridesReadOnly()
+    assert get_r(o) == 2
+    assert get_r(o) == 2
+    assert o.r == 2
+    assert o.calls == 1
+    o.r = 3
+    assert get_r(o) == 3
+
+class AttributeOverride(A):
+    p: object
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.p = "attr"
+
+def test_attribute_overrides_cached_property() -> None:
+    o = AttributeOverride()
+    assert o.p == "attr"
+    assert get_p(o) == "attr"
+    set_p(o, "new")
+    assert o.p == "new"
+    assert get_p(o) == "new"
+    assert o.calls == 0
+
+[case testCachedPropertyInterpretedSubclass]
+from functools import cached_property
+from mypy_extensions import mypyc_attr
+
+@mypyc_attr(allow_interpreted_subclasses=True)
+class Open:
+    def __init__(self) -> None:
+        self.count = 0
+
+    @cached_property
+    def val(self) -> int:
+        self.count += 1
+        return 10
+
+def read_val(o: Open) -> int:
+    return o.val
+
+def write_val(o: Open, val: int) -> None:
+    o.val = val
+
+[file driver.py]
+from functools import cached_property
+from native import Open, read_val, write_val
+
+# Reads of the inherited cached property see cached semantics
+class Sub(Open):
+    pass
+
+s = Sub()
+assert read_val(s) == 10
+assert read_val(s) == 10
+assert s.val == 10
+assert s.count == 1
+write_val(s, 11)
+assert s.val == 11 and read_val(s) == 11
+del s.val
+assert s.val == 10
+assert s.count == 2
+
+# An interpreted cached_property override is respected when reading
+# through the base class
+class SubOverride(Open):
+    @cached_property
+    def val(self) -> int:
+        self.count += 1
+        return 20
+
+o = SubOverride()
+assert read_val(o) == 20
+assert o.val == 20
+assert o.count == 1
+
+[case testCachedPropertyInstanceDict]
+# Where the cached value is stored depends on whether the instance has a
+# __dict__, which differs between a native class and its interpreted subclass.
+from functools import cached_property
+from mypy_extensions import mypyc_attr
+
+@mypyc_attr(allow_interpreted_subclasses=True)
+class Native:
+    def __init__(self) -> None:
+        self.runs = 0
+
+    @cached_property
+    def val(self) -> int:
+        self.runs += 1
+        return 10
+
+[file driver.py]
+from functools import cached_property
+from native import Native
+from testutil import assertRaises
+
+# A native (compiled) class has no instance __dict__. Its cached_property
+# memoizes into a hidden native slot, so caching works regardless.
+n = Native()
+assert not hasattr(n, "__dict__")
+assert n.val == 10 and n.val == 10
+assert n.runs == 1
+
+# CPython gives an *interpreted* subclass of a native class its own instance
+# __dict__ (a heap subclass of an extension type that lacks one gets a dict
+# added automatically). So a cached_property defined on the interpreted
+# subclass memoizes into that __dict__ with no extra setup, while the
+# inherited native cached_property keeps using the native slot.
+class Sub(Native):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sub_runs = 0
+
+    @cached_property
+    def sub_val(self) -> int:
+        self.sub_runs += 1
+        return 20
+
+s = Sub()
+assert hasattr(s, "__dict__")
+assert "sub_val" not in s.__dict__
+assert s.sub_val == 20 and s.sub_val == 20
+assert s.sub_runs == 1
+assert s.__dict__["sub_val"] == 20      # subclass cached_property -> instance __dict__
+assert s.val == 10 and s.val == 10
+assert s.runs == 1
+assert "val" not in s.__dict__          # inherited native cached_property -> native slot
+
+# A subclass that suppresses the instance __dict__ with __slots__ cannot use a
+# functools.cached_property defined on it: this raises at access time. This is
+# ordinary CPython behaviour and is unaffected by mypyc.
+class Slotted(Native):
+    __slots__ = ()
+
+    @cached_property
+    def slot_val(self) -> int:
+        return 30
+
+assert not hasattr(Slotted(), "__dict__")
+with assertRaises(TypeError, "__dict__"):
+    Slotted().slot_val
+
+[case testCachedPropertyNonNativeClass]
+from functools import cached_property
+from mypy_extensions import mypyc_attr
+
+@mypyc_attr(native_class=False)
+class NonNative:
+    def __init__(self) -> None:
+        self.count = 0
+
+    @cached_property
+    def val(self) -> int:
+        self.count += 1
+        return 5
+
+def test_non_native_cached_property() -> None:
+    # Non-native classes use functools.cached_property directly
+    assert isinstance(getattr(NonNative, "val"), cached_property)
+    o = NonNative()
+    assert o.val == 5
+    assert o.val == 5
+    assert o.count == 1
+    o.val = 6
+    assert o.val == 6
+    del o.val
+    assert o.val == 5
+    assert o.count == 2
+
+[case testNonNativeClassAbstractProperty]
+from abc import ABCMeta, abstractproperty
+from typing import Any
+
+from mypy_extensions import mypyc_attr
+from testutil import assertRaises
+
+@mypyc_attr(native_class=False)
+class Abstract(metaclass=ABCMeta):
+    @abstractproperty
+    def value(self) -> int:
+        return 0
+
+def test_abstract_property() -> None:
+    # Non-native classes use the original decorator instead of builtins.property
+    assert type(getattr(Abstract, "value")).__name__ == "abstractproperty"
+    a: Any = Abstract
+    with assertRaises(TypeError, "abstract"):
+        a()

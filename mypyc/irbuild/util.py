@@ -43,6 +43,15 @@ MYPYC_ATTRS: Final[frozenset[MypycAttr]] = frozenset(
 
 DATACLASS_DECORATORS: Final = frozenset(["dataclasses.dataclass", "attr.s", "attr.attrs"])
 
+# Decorators that the semantic analyzer turns into FuncDef.is_property
+PROPERTY_DECORATORS: Final = (
+    "builtins.property",
+    "abc.abstractproperty",
+    "functools.cached_property",
+    "enum.property",
+    "types.DynamicClassAttribute",
+)
+
 
 MypycAttr = Literal[
     "native_class", "allow_interpreted_subclasses", "serializable", "free_list_len", "acyclic"
@@ -63,6 +72,33 @@ def is_final_decorator(d: Expression) -> bool:
 
 def is_trait_decorator(d: Expression) -> bool:
     return isinstance(d, RefExpr) and d.fullname == "mypy_extensions.trait"
+
+
+def get_property_decorator(node: Decorator) -> Expression | None:
+    """Return the decorator that made the decorated function a property, if any.
+
+    The semantic analyzer removes property decorators from Decorator.decorators
+    (it only marks the function as a property), so we need to look at the
+    original decorators.
+    """
+    if node.func.is_property:
+        for d in node.original_decorators:
+            if refers_to_fullname(d, PROPERTY_DECORATORS):
+                return d
+    return None
+
+
+def is_cached_property(node: Decorator) -> bool:
+    """Is the decorated function a functools.cached_property?
+
+    Ignore properties that have additional decorators.
+    """
+    d = get_property_decorator(node)
+    return (
+        d is not None
+        and not node.decorators
+        and refers_to_fullname(d, "functools.cached_property")
+    )
 
 
 def is_trait(cdef: ClassDef) -> bool:

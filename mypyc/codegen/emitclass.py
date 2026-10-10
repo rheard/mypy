@@ -35,6 +35,7 @@ from mypyc.common import (
     MYPYC_DEFAULTS_SETUP,
     NATIVE_PREFIX,
     PREFIX,
+    PROPCACHE_PREFIX,
     REG_PREFIX,
     RUNNING_FIELD,
     short_id_from_name,
@@ -1438,6 +1439,42 @@ def generate_property_setter(
     emitter.emit_line("{")
     ret_type = func_ir.ret_type
     emitter.emit_line(f"{emitter.ctype(ret_type)} retval = {emitter.c_undefined_value(ret_type)};")
+    # A NULL value means that the attribute is being deleted.
+    emitter.emit_line("if (value == NULL) {")
+    if cl.is_cached_property(attr):
+        # Deleting a functools.cached_property clears the cached value, so that
+        # it is recomputed on the next read. This matches CPython semantics,
+        # including raising AttributeError if there is no cached value.
+        slot_expr = f"self->{emitter.attr(PROPCACHE_PREFIX + attr)}"
+        if IS_FREE_THREADED:
+            # Access the slot like the getters and setters of attributes do
+            emitter.emit_line(
+                f"PyObject *cached = CPy_GetAttrRef((PyObject *)self, (PyObject **)&{slot_expr});"
+            )
+            emitter.emit_line("if (cached == NULL) {")
+        else:
+            emitter.emit_line(f"if ({slot_expr} == NULL) {{")
+        emitter.emit_line("PyErr_SetString(PyExc_AttributeError,")
+        emitter.emit_line(f'    "attribute {repr(attr)} of {repr(cl.name)} undefined");')
+        emitter.emit_line("return -1;")
+        emitter.emit_line("}")
+        if IS_FREE_THREADED:
+            emitter.emit_line("Py_DECREF(cached);")
+            emitter.emit_line(
+                f"CPy_SetAttrRef((PyObject *)self, (PyObject **)&{slot_expr}, NULL);"
+            )
+        else:
+            emitter.emit_line(f"Py_CLEAR({slot_expr});")
+        emitter.emit_line("return 0;")
+    else:
+        # Properties otherwise have no deleter, so raise AttributeError
+        # (instead of calling the setter with a NULL value).
+        emitter.emit_line("PyErr_SetString(PyExc_AttributeError,")
+        emitter.emit_line(
+            f'    "{repr(cl.name)} object attribute {repr(attr)} cannot be deleted");'
+        )
+        emitter.emit_line("return -1;")
+    emitter.emit_line("}")
     if arg_type.is_unboxed:
         emitter.emit_unbox("value", "tmp", arg_type, error=ReturnHandler("-1"), declare_dest=True)
         emitter.emit_line(
